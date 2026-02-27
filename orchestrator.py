@@ -7,7 +7,7 @@ from agents.govt_agent import govt_agent
 from agents.practical_agent import practical_agent
 from llm_router import ask_llm
 
-SAFE_THRESHOLD = 0.75
+SAFE_THRESHOLD = 0.65
 
 
 # ----------------------------------------
@@ -27,6 +27,17 @@ def calculate_evidence_score(item):
     return min(base, 1.0)
 
 
+def calculate_impact_score(item):
+    impact = item.get("evidence_score", 0)
+
+    if item.get("source") == "Govt Advisory":
+        impact += 0.2
+    if item.get("source") == "ResearchPaper":
+        impact += 0.1
+
+    return impact
+
+
 # ----------------------------------------
 # Domain Relevance Filtering
 # ----------------------------------------
@@ -34,11 +45,37 @@ def calculate_evidence_score(item):
 def is_relevant(item, domain):
     text = str(item).lower()
 
-    # Block obvious fertilizer garbage in wrong domains
+    # Example basic protection against cross-domain contamination
     if domain in ["fish_farming", "cattle_management"] and "fertilizer" in text:
         return False
 
     return True
+
+
+# ----------------------------------------
+# Semantic Duplicate Removal (Domain-Universal)
+# ----------------------------------------
+
+def remove_semantic_duplicates(solutions):
+    unique = []
+    mechanisms_seen = []
+
+    for sol in solutions:
+        mechanism = sol.get("core_mechanism", "").lower()
+        duplicate = False
+
+        for existing in mechanisms_seen:
+            overlap = len(set(mechanism.split()) & set(existing.split()))
+            if overlap > 3:
+                duplicate = True
+                break
+
+        if not duplicate:
+            mechanisms_seen.append(mechanism)
+            unique.append(sol)
+
+    return unique
+
 
 # ----------------------------------------
 # Main Orchestrator
@@ -55,9 +92,9 @@ async def orchestrate(query: str):
             "message": "Unable to classify agriculture domain."
         }
 
-    # 2️⃣ Call agents
+    # 2️⃣ Call domain-aware agents
     tasks = [
-        research_agent(query),
+        research_agent(query, domain),
         govt_agent(query),
         practical_agent(query)
     ]
@@ -72,11 +109,11 @@ async def orchestrate(query: str):
             "message": "No relevant data found."
         }
 
-    # 3️⃣ Evidence Scoring
+    # 3️⃣ Evidence scoring
     for item in combined:
         item["evidence_score"] = calculate_evidence_score(item)
 
-    # 4️⃣ Filter by Evidence + Domain Relevance
+    # 4️⃣ Filter by evidence threshold + domain relevance
     filtered = [
         item for item in combined
         if item["evidence_score"] >= SAFE_THRESHOLD
@@ -89,11 +126,21 @@ async def orchestrate(query: str):
             "message": "No strong domain-relevant verified evidence found."
         }
 
-    # 5️⃣ Final Advisory LLM
+    # 5️⃣ Impact ranking
+    for item in filtered:
+        item["impact_score"] = calculate_impact_score(item)
+
+    filtered = sorted(filtered, key=lambda x: x["impact_score"], reverse=True)
+
+    # Reduce noise
+    filtered = filtered[:10]
+
+    # 6️⃣ Final Advisory LLM Prompt (Domain-Universal)
     prompt = f"""
 You are a professional agricultural technical advisor.
 
-Provide the TOP 5 most effective DISTINCT methods to solve the problem.
+Provide the TOP 5 most effective DISTINCT corrective methods 
+to solve the stated agricultural problem.
 
 Return ONLY valid JSON in this structure:
 
@@ -116,18 +163,13 @@ Return ONLY valid JSON in this structure:
 }}
 
 STRICT RULES:
-- Provide EXACTLY 5 methods.
-- Rank them by real-world effectiveness (1 = highest impact).
-- Each method must use a different technical mechanism.
-- No duplicate wording.
-- No step-by-step instructions.
-- No long paragraphs.
-- No filler explanation.
-- Only practical, technically correct solutions.
-- Do NOT include unrelated cross-domain advice.
-- No vague verbs like "Improve", "Enhance", "Optimize".
-- Use specific technical interventions.
-- Methods must be practical and widely used.
+- Provide EXACTLY 5 direct corrective methods.
+- Each method must directly solve the stated problem.
+- Exclude monitoring, diagnosis, advisory-only steps.
+- No duplicate mechanisms.
+- Each method must represent a different intervention approach.
+- Keep responses short and technical.
+- No vague verbs.
 - Poll options must match method_name exactly.
 - Output ONLY JSON.
 
@@ -137,7 +179,7 @@ Verified Evidence:
 
     analysis = ask_llm(prompt)
 
-    # 6️⃣ Safe JSON Extraction (Repair LLM formatting issues)
+    # 7️⃣ Safe JSON Extraction
     try:
         json_match = re.search(r'\{.*\}', analysis, re.DOTALL)
 
@@ -152,6 +194,18 @@ Verified Evidence:
             "message": "LLM JSON parsing failed",
             "raw_output": analysis
         }
+
+    # 8️⃣ Enforce semantic uniqueness
+    solutions = structured_output.get("top_solutions_ranked", [])
+    solutions = remove_semantic_duplicates(solutions)
+
+    if len(solutions) < 5:
+        return {
+            "status": "uncertain",
+            "message": "Generated solutions overlap or are not sufficiently distinct."
+        }
+
+    structured_output["top_solutions_ranked"] = solutions[:5]
 
     return {
         "status": "success",
